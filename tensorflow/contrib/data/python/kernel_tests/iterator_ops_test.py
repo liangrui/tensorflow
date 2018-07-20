@@ -1,4 +1,4 @@
-# Copyright 2017 The TensorFlow Authors. All Rights Reserved.
+# Copyright 2018 The TensorFlow Authors. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,241 +12,112 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Tests for the experimental input pipeline ops."""
+"""Tests for experimental iterator_ops."""
+
 from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
-import numpy as np
-
-from tensorflow.contrib.data.python.ops import dataset_ops
-from tensorflow.python.client import session
+from tensorflow.contrib.data.python.ops import iterator_ops
+from tensorflow.python.data.ops import dataset_ops
+from tensorflow.python.estimator import estimator
+from tensorflow.python.estimator import model_fn
 from tensorflow.python.framework import constant_op
 from tensorflow.python.framework import dtypes
-from tensorflow.python.framework import errors
 from tensorflow.python.framework import ops
-from tensorflow.python.ops import math_ops
+from tensorflow.python.ops import control_flow_ops
+from tensorflow.python.ops import variables
 from tensorflow.python.platform import test
-from tensorflow.python.training import server_lib
+from tensorflow.python.training import saver as saver_lib
+from tensorflow.python.training import training_util
 
 
-class IteratorTest(test.TestCase):
+class CheckpointInputPipelineHookTest(test.TestCase):
 
-  def testOneShotIterator(self):
-    components = [np.arange(7),
-                  np.array([[1, 2, 3]]) * np.arange(7)[:, np.newaxis],
-                  np.array(37.0) * np.arange(7)]
+  @staticmethod
+  def _model_fn(features, labels, mode, config):
+    del labels
+    del mode
+    del config
+    global_step = training_util.get_or_create_global_step()
+    update_global_step_op = global_step.assign_add(1)
+    latest_feature = variables.Variable(
+        0, name='latest_feature', dtype=dtypes.int64)
+    store_latest_feature_op = latest_feature.assign(features)
+    ops.add_to_collection('my_vars', global_step)
+    ops.add_to_collection('my_vars', latest_feature)
+    return model_fn.EstimatorSpec(
+        mode='train',
+        train_op=control_flow_ops.group(
+            [update_global_step_op, store_latest_feature_op]),
+        loss=constant_op.constant(2.0))
 
-    def _map_fn(x, y, z):
-      return math_ops.square(x), math_ops.square(y), math_ops.square(z)
+  def _read_vars(self, model_dir):
+    """Returns (global_step, latest_feature)."""
+    with ops.Graph().as_default() as g:
+      ckpt_path = saver_lib.latest_checkpoint(model_dir)
+      meta_filename = ckpt_path + '.meta'
+      saver_lib.import_meta_graph(meta_filename)
+      saver = saver_lib.Saver()
+      with self.test_session(graph=g) as sess:
+        saver.restore(sess, ckpt_path)
+        return sess.run(ops.get_collection('my_vars'))
 
-    iterator = (dataset_ops.Dataset.from_tensor_slices(components).map(_map_fn)
-                .repeat(14).make_one_shot_iterator())
-    get_next = iterator.get_next()
+  def _build_iterator_saver_hook(self, est):
+    return iterator_ops.CheckpointInputPipelineHook(est)
 
-    self.assertEqual([c.shape[1:] for c in components],
-                     [t.shape for t in get_next])
+  def testReturnDatasetFromInputFn(self):
 
-    with self.test_session() as sess:
-      for _ in range(14):
-        for i in range(7):
-          result = sess.run(get_next)
-          for component, result_component in zip(components, result):
-            self.assertAllEqual(component[i]**2, result_component)
-      with self.assertRaises(errors.OutOfRangeError):
-        sess.run(get_next)
+    def _input_fn():
+      return dataset_ops.Dataset.range(10)
 
-  def testOneShotIteratorCaptureByValue(self):
-    components = [np.arange(7),
-                  np.array([[1, 2, 3]]) * np.arange(7)[:, np.newaxis],
-                  np.array(37.0) * np.arange(7)]
-    tensor_components = [ops.convert_to_tensor(c) for c in components]
+    est = estimator.Estimator(model_fn=self._model_fn)
 
-    def _map_fn(x, y, z):
-      return math_ops.square(x), math_ops.square(y), math_ops.square(z)
+    est.train(_input_fn, steps=2, hooks=[self._build_iterator_saver_hook(est)])
+    self.assertSequenceEqual(self._read_vars(est.model_dir), (2, 1))
+    est.train(_input_fn, steps=2, hooks=[self._build_iterator_saver_hook(est)])
+    self.assertSequenceEqual(self._read_vars(est.model_dir), (4, 3))
 
-    iterator = (dataset_ops.Dataset.from_tensor_slices(tensor_components)
-                .map(_map_fn).repeat(14).make_one_shot_iterator())
-    get_next = iterator.get_next()
+  def testBuildIteratorInInputFn(self):
 
-    self.assertEqual([c.shape[1:] for c in components],
-                     [t.shape for t in get_next])
-
-    with self.test_session() as sess:
-      for _ in range(14):
-        for i in range(7):
-          result = sess.run(get_next)
-          for component, result_component in zip(components, result):
-            self.assertAllEqual(component[i]**2, result_component)
-      with self.assertRaises(errors.OutOfRangeError):
-        sess.run(get_next)
-
-  def testOneShotIteratorInsideContainer(self):
-    components = [np.arange(7),
-                  np.array([[1, 2, 3]]) * np.arange(7)[:, np.newaxis],
-                  np.array(37.0) * np.arange(7)]
-
-    def within_container():
-      def _map_fn(x, y, z):
-        return math_ops.square(x), math_ops.square(y), math_ops.square(z)
-      iterator = (dataset_ops.Dataset.from_tensor_slices(components)
-                  .map(_map_fn).repeat(14).make_one_shot_iterator())
+    def _input_fn():
+      ds = dataset_ops.Dataset.range(10)
+      iterator = ds.make_one_shot_iterator()
       return iterator.get_next()
 
-    server = server_lib.Server.create_local_server()
+    est = estimator.Estimator(model_fn=self._model_fn)
 
-    # Create two iterators within unique containers, and run them to
-    # make sure that the resources aren't shared.
-    #
-    # The test below would fail if cname were the same across both
-    # sessions.
-    for i in range(2):
-      with session.Session(server.target) as sess:
-        cname = "iteration%d" % i
-        with ops.container(cname):
-          get_next = within_container()
+    est.train(_input_fn, steps=2, hooks=[self._build_iterator_saver_hook(est)])
+    self.assertSequenceEqual(self._read_vars(est.model_dir), (2, 1))
+    est.train(_input_fn, steps=2, hooks=[self._build_iterator_saver_hook(est)])
+    self.assertSequenceEqual(self._read_vars(est.model_dir), (4, 3))
 
-        for _ in range(14):
-          for i in range(7):
-            result = sess.run(get_next)
-            for component, result_component in zip(components, result):
-              self.assertAllEqual(component[i]**2, result_component)
-        with self.assertRaises(errors.OutOfRangeError):
-          sess.run(get_next)
+  def testDoNotRestore(self):
 
-  def testSimpleSharedResource(self):
-    components = [
-        np.array(1, dtype=np.int64),
-        np.array([1, 2, 3], dtype=np.int64),
-        np.array(37.0, dtype=np.float64)
-    ]
+    def _input_fn():
+      return dataset_ops.Dataset.range(10)
 
-    server = server_lib.Server.create_local_server()
+    est = estimator.Estimator(model_fn=self._model_fn)
 
-    # Create two non-overlapping sessions that share the same iterator
-    # resource on the same server, and verify that an action of the
-    # first session (initializing the iterator) is visible in the
-    # second session.
-    with ops.Graph().as_default():
-      iterator = (dataset_ops.Dataset.from_tensors(components)
-                  .map(lambda x, y, z: (x, y, z)).make_initializable_iterator(
-                      shared_name="shared_iterator"))
-      init_op = iterator.initializer
-      get_next = iterator.get_next()
+    est.train(_input_fn, steps=2, hooks=[self._build_iterator_saver_hook(est)])
+    self.assertSequenceEqual(self._read_vars(est.model_dir), (2, 1))
+    est.train(_input_fn, steps=2, hooks=[self._build_iterator_saver_hook(est)])
+    self.assertSequenceEqual(self._read_vars(est.model_dir), (4, 3))
+    # Hook not provided, input pipeline was not restored.
+    est.train(_input_fn, steps=2)
+    self.assertSequenceEqual(self._read_vars(est.model_dir), (6, 1))
 
-      with session.Session(server.target) as sess:
-        sess.run(init_op)
-        results = sess.run(get_next)
-        for component, result_component in zip(components, results):
-          self.assertAllEqual(component, result_component)
-        with self.assertRaises(errors.OutOfRangeError):
-          sess.run(get_next)
+  def testRaiseErrorIfNoIterator(self):
 
-        # Re-initialize the iterator in the first session.
-        sess.run(init_op)
+    def _input_fn():
+      return constant_op.constant(1, dtype=dtypes.int64)
 
-    with ops.Graph().as_default():
-      # Re-define the iterator manually, without defining any of the
-      # functions in this graph, to ensure that we are not
-      # accidentally redefining functions with the same names in the
-      # new graph.
-      iterator = dataset_ops.Iterator.from_structure(
-          shared_name="shared_iterator",
-          output_types=[dtypes.int64, dtypes.int64, dtypes.float64],
-          output_shapes=[[], [3], []])
-      get_next = iterator.get_next()
+    est = estimator.Estimator(model_fn=self._model_fn)
 
-      with session.Session(server.target) as sess:
-        # Use the iterator without re-initializing in the second session.
-        results = sess.run(get_next)
-        for component, result_component in zip(components, results):
-          self.assertAllEqual(component, result_component)
-        with self.assertRaises(errors.OutOfRangeError):
-          sess.run(get_next)
-
-  def testNotInitializedError(self):
-    components = [np.array(1), np.array([1, 2, 3]), np.array(37.0)]
-    iterator = (dataset_ops.Dataset.from_tensors(components)
-                .make_initializable_iterator())
-    get_next = iterator.get_next()
-
-    with self.test_session() as sess:
-      with self.assertRaisesRegexp(errors.FailedPreconditionError,
-                                   "iterator has not been initialized"):
-        sess.run(get_next)
-
-  def testReinitializableIterator(self):
-    dataset_3 = dataset_ops.Dataset.from_tensors(
-        constant_op.constant([1, 2, 3]))
-    dataset_4 = dataset_ops.Dataset.from_tensors(
-        constant_op.constant([4, 5, 6, 7]))
-    iterator = dataset_ops.Iterator.from_structure(dataset_3.output_types,
-                                                   [None])
-
-    dataset_3_init_op = iterator.make_initializer(dataset_3)
-    dataset_4_init_op = iterator.make_initializer(dataset_4)
-    get_next = iterator.get_next()
-
-    self.assertEqual(dataset_3.output_types, iterator.output_types)
-    self.assertEqual(dataset_4.output_types, iterator.output_types)
-    self.assertEqual([None], iterator.output_shapes.as_list())
-
-    with self.test_session() as sess:
-      # The iterator is initially uninitialized.
-      with self.assertRaises(errors.FailedPreconditionError):
-        sess.run(get_next)
-
-      # Initialize with one dataset.
-      sess.run(dataset_3_init_op)
-      self.assertAllEqual([1, 2, 3], sess.run(get_next))
-      with self.assertRaises(errors.OutOfRangeError):
-        sess.run(get_next)
-
-      # Initialize with a different dataset.
-      sess.run(dataset_4_init_op)
-      self.assertAllEqual([4, 5, 6, 7], sess.run(get_next))
-      with self.assertRaises(errors.OutOfRangeError):
-        sess.run(get_next)
-
-      # Reinitialize with the first dataset.
-      sess.run(dataset_3_init_op)
-      self.assertAllEqual([1, 2, 3], sess.run(get_next))
-      with self.assertRaises(errors.OutOfRangeError):
-        sess.run(get_next)
-
-  def testReinitializableIteratorStaticErrors(self):
-    # Non-matching structure for types and shapes.
-    with self.assertRaises(TypeError):
-      iterator = dataset_ops.Iterator.from_structure((dtypes.int64,
-                                                      dtypes.float64), [None])
-
-    # Test validation of dataset argument.
-    iterator = dataset_ops.Iterator.from_structure((dtypes.int64,
-                                                    dtypes.float64))
-
-    # Incompatible structure.
     with self.assertRaises(ValueError):
-      iterator.make_initializer(
-          dataset_ops.Dataset.from_tensors(((constant_op.constant(
-              [1, 2, 3], dtype=dtypes.int64),), (constant_op.constant(
-                  [4., 5., 6., 7.], dtype=dtypes.float64),))))
-
-    # Incompatible types.
-    with self.assertRaises(TypeError):
-      iterator.make_initializer(
-          dataset_ops.Dataset.from_tensors((constant_op.constant(
-              [1, 2, 3], dtype=dtypes.int32), constant_op.constant(
-                  [4., 5., 6., 7.], dtype=dtypes.float32))))
-
-    # Incompatible shapes.
-    iterator = dataset_ops.Iterator.from_structure(
-        (dtypes.int64, dtypes.float64), ([None], []))
-    with self.assertRaises(TypeError):
-      iterator.make_initializer(
-          dataset_ops.Dataset.from_tensors((constant_op.constant(
-              [1, 2, 3], dtype=dtypes.int64), constant_op.constant(
-                  [4., 5., 6., 7.], dtype=dtypes.float64))))
+      est.train(
+          _input_fn, steps=2, hooks=[self._build_iterator_saver_hook(est)])
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
   test.main()

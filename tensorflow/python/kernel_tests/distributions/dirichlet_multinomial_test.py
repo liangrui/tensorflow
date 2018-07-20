@@ -17,6 +17,9 @@ from __future__ import division
 from __future__ import print_function
 
 import numpy as np
+
+from tensorflow.python.eager import backprop
+from tensorflow.python.framework import constant_op
 from tensorflow.python.framework import dtypes
 from tensorflow.python.framework import tensor_shape
 from tensorflow.python.ops import array_ops
@@ -74,10 +77,10 @@ class DirichletMultinomialTest(test.TestCase):
       dist = ds.DirichletMultinomial(n, alpha, validate_args=True)
       dist.prob([2., 3, 0]).eval()
       dist.prob([3., 0, 2]).eval()
-      with self.assertRaisesOpError("counts must be non-negative"):
+      with self.assertRaisesOpError("must be non-negative"):
         dist.prob([-1., 4, 2]).eval()
       with self.assertRaisesOpError(
-          "counts last-dimension must sum to `self.total_count`"):
+          "last-dimension must sum to `self.total_count`"):
         dist.prob([3., 3, 0]).eval()
 
   def testPmfNonIntegerCounts(self):
@@ -91,7 +94,7 @@ class DirichletMultinomialTest(test.TestCase):
       # Both equality and integer checking fail.
       placeholder = array_ops.placeholder(dtypes.float32)
       with self.assertRaisesOpError(
-          "counts cannot contain fractional components"):
+          "cannot contain fractional components"):
         dist.prob(placeholder).eval(feed_dict={placeholder: [1.0, 2.5, 1.5]})
       dist = ds.DirichletMultinomial(n, alpha, validate_args=False)
       dist.prob([1., 2., 3.]).eval()
@@ -250,10 +253,10 @@ class DirichletMultinomialTest(test.TestCase):
           dist.variance(),
           dist.stddev(),
       ])
-      self.assertAllClose(sample_mean_, analytic_mean, atol=0., rtol=0.04)
-      self.assertAllClose(sample_cov_, analytic_cov, atol=0., rtol=0.05)
-      self.assertAllClose(sample_var_, analytic_var, atol=0., rtol=0.03)
-      self.assertAllClose(sample_stddev_, analytic_stddev, atol=0., rtol=0.02)
+      self.assertAllClose(sample_mean_, analytic_mean, atol=0.04, rtol=0.)
+      self.assertAllClose(sample_cov_, analytic_cov, atol=0.05, rtol=0.)
+      self.assertAllClose(sample_var_, analytic_var, atol=0.05, rtol=0.)
+      self.assertAllClose(sample_stddev_, analytic_stddev, atol=0.02, rtol=0.)
 
   def testCovariance(self):
     # Shape [2]
@@ -442,7 +445,7 @@ class DirichletMultinomialTest(test.TestCase):
           dist.covariance(),
       ])
       self.assertAllEqual([4, 3, 2], sample_mean.get_shape())
-      self.assertAllClose(actual_mean_, sample_mean_, atol=0., rtol=0.15)
+      self.assertAllClose(actual_mean_, sample_mean_, atol=0., rtol=0.20)
       self.assertAllEqual([4, 3, 2, 2], sample_covariance.get_shape())
       self.assertAllClose(
           actual_covariance_, sample_covariance_, atol=0., rtol=0.20)
@@ -470,10 +473,25 @@ class DirichletMultinomialTest(test.TestCase):
           dist.covariance(),
       ])
       self.assertAllEqual([4], sample_mean.get_shape())
-      self.assertAllClose(actual_mean_, sample_mean_, atol=0., rtol=0.05)
+      self.assertAllClose(actual_mean_, sample_mean_, atol=0., rtol=0.20)
       self.assertAllEqual([4, 4], sample_covariance.get_shape())
       self.assertAllClose(
-          actual_covariance_, sample_covariance_, atol=0., rtol=0.15)
+          actual_covariance_, sample_covariance_, atol=0., rtol=0.20)
+
+  def testNotReparameterized(self):
+    total_count = constant_op.constant(5.0)
+    concentration = constant_op.constant([0.1, 0.1, 0.1])
+    with backprop.GradientTape() as tape:
+      tape.watch(total_count)
+      tape.watch(concentration)
+      dist = ds.DirichletMultinomial(
+          total_count=total_count,
+          concentration=concentration)
+      samples = dist.sample(100)
+    grad_total_count, grad_concentration = tape.gradient(
+        samples, [total_count, concentration])
+    self.assertIsNone(grad_total_count)
+    self.assertIsNone(grad_concentration)
 
 
 if __name__ == "__main__":

@@ -20,6 +20,7 @@ from __future__ import print_function
 
 import six
 
+from tensorflow.python.util import tf_export
 from tensorflow.python.util import tf_inspect
 
 
@@ -30,7 +31,7 @@ class DocGeneratorVisitor(object):
     """Make a visitor.
 
     As this visitor is starting its traversal at a module or class, it will not
-    be old the name of that object during traversal. `root_name` is the name it
+    be told the name of that object during traversal. `root_name` is the name it
     should use for that object, effectively prefixing all names with
     "root_name.".
 
@@ -201,7 +202,6 @@ class DocGeneratorVisitor(object):
             raw_duplicates[master_name] = [master_name, full_name]
         else:
           reverse_index[object_id] = full_name
-
     # Decide on master names, rewire duplicates and make a duplicate_of map
     # mapping all non-master duplicates to the master name. The master symbol
     # does not have an entry in this map.
@@ -211,10 +211,15 @@ class DocGeneratorVisitor(object):
     duplicates = {}
     for names in raw_duplicates.values():
       names = sorted(names)
-
-      # Choose the lexicographically first name with the minimum number of
-      # submodules. This will prefer highest level namespace for any symbol.
-      master_name = min(names, key=lambda name: name.count('.'))
+      master_name = (
+          tf_export.get_canonical_name_for_symbol(self._index[names[0]])
+          if names else None)
+      if master_name:
+        master_name = 'tf.%s' % master_name
+      else:
+        # Choose the lexicographically first name with the minimum number of
+        # submodules. This will prefer highest level namespace for any symbol.
+        master_name = min(names, key=lambda name: name.count('.'))
 
       duplicates[master_name] = names
       for name in names:

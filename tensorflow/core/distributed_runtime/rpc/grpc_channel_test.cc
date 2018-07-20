@@ -31,9 +31,9 @@ TEST(GrpcChannelTest, IsSameAddressSpace) {
   EXPECT_TRUE(IsSameAddrSp("/job:mnist/replica:10/task:10/cpu:0",
                            "/job:mnist/replica:10/task:10/cpu:1"));
   EXPECT_TRUE(IsSameAddrSp("/job:mnist/replica:10/task:10/cpu:0",
-                           "/job:mnist/replica:10/task:10/gpu:2"));
+                           "/job:mnist/replica:10/task:10/device:GPU:2"));
   EXPECT_TRUE(IsSameAddrSp("/job:mnist/replica:10/task:10",
-                           "/job:mnist/replica:10/task:10/gpu:2"));
+                           "/job:mnist/replica:10/task:10/device:GPU:2"));
   EXPECT_TRUE(IsSameAddrSp("/job:mnist/replica:10/task:10/cpu:1",
                            "/job:mnist/replica:10/task:10"));
 
@@ -150,10 +150,15 @@ TEST(GrpcChannelTest, NewHostPortGrpcChannelValidation) {
   EXPECT_TRUE(NewHostPortGrpcChannel("127.0.0.1:2222", &mock_ptr).ok());
   EXPECT_TRUE(NewHostPortGrpcChannel("example.com:2222", &mock_ptr).ok());
   EXPECT_TRUE(NewHostPortGrpcChannel("fqdn.example.com.:2222", &mock_ptr).ok());
+  EXPECT_TRUE(NewHostPortGrpcChannel("[2002:a9c:258e::]:2222", &mock_ptr).ok());
+  EXPECT_TRUE(NewHostPortGrpcChannel("[::]:2222", &mock_ptr).ok());
 
   EXPECT_FALSE(NewHostPortGrpcChannel("example.com/abc:2222", &mock_ptr).ok());
   EXPECT_FALSE(NewHostPortGrpcChannel("127.0.0.1:2222/", &mock_ptr).ok());
   EXPECT_FALSE(NewHostPortGrpcChannel("example.com/abc:", &mock_ptr).ok());
+  EXPECT_FALSE(NewHostPortGrpcChannel("[::]/:2222", &mock_ptr).ok());
+  EXPECT_FALSE(NewHostPortGrpcChannel("[::]:2222/", &mock_ptr).ok());
+  EXPECT_FALSE(NewHostPortGrpcChannel("[::]:", &mock_ptr).ok());
 }
 
 }  // namespace tensorflow

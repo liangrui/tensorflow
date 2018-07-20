@@ -17,314 +17,252 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
+import hashlib
+import itertools
+import os
+import time
+
 import numpy as np
 
-from tensorflow.contrib.data.python.ops import dataset_ops
-from tensorflow.python.framework import constant_op
-from tensorflow.python.framework import dtypes
+from tensorflow.contrib.data.python.ops import batching
+from tensorflow.contrib.data.python.ops import error_ops
+from tensorflow.core.protobuf import config_pb2
+from tensorflow.python.client import session
+from tensorflow.python.data.ops import dataset_ops
 from tensorflow.python.framework import errors
+from tensorflow.python.framework import ops
 from tensorflow.python.ops import array_ops
-from tensorflow.python.ops import data_flow_ops
-from tensorflow.python.ops import lookup_ops
+from tensorflow.python.ops import io_ops
 from tensorflow.python.ops import math_ops
-from tensorflow.python.ops import random_ops
-from tensorflow.python.ops import string_ops
-from tensorflow.python.ops import variable_scope
 from tensorflow.python.platform import test
+from tensorflow.python.util import compat
+
+_NUMPY_RANDOM_SEED = 42
 
 
 class MapDatasetTest(test.TestCase):
 
-  def _buildMapDataset(self, components, count):
-    def _map_fn(x, y, z):
-      return math_ops.square(x), math_ops.square(y), math_ops.square(z)
-    return (dataset_ops.Dataset.from_tensor_slices(components).map(_map_fn)
-            .repeat(count))
+  def testMapIgnoreError(self):
+    components = np.array([1., 2., 3., np.nan, 5.]).astype(np.float32)
 
-  def testMapDataset(self):
-    """Test an dataset that maps a TF function across its input elements."""
-    # The pipeline is TensorSliceDataset -> MapDataset(square_3) ->
-    # RepeatDataset(count).
-    components = [np.arange(7),
-                  np.array([[1, 2, 3]]) * np.arange(7)[:, np.newaxis],
-                  np.array(37.0) * np.arange(7)]
-    count = array_ops.placeholder(dtypes.int64, shape=[])
-
-    dataset = self._buildMapDataset(components, count)
+    dataset = (
+        dataset_ops.Dataset.from_tensor_slices(components)
+        .map(lambda x: array_ops.check_numerics(x, "message")).apply(
+            error_ops.ignore_errors()))
     iterator = dataset.make_initializable_iterator()
     init_op = iterator.initializer
     get_next = iterator.get_next()
 
-    self.assertEqual([c.shape[1:] for c in components],
-                     [t.shape for t in get_next])
-
     with self.test_session() as sess:
-      # Test single-threaded access to the iterator.
-      sess.run(init_op, feed_dict={count: 14})
-      for _ in range(14):
-        for i in range(7):
-          result = sess.run(get_next)
-          for component, result_component in zip(components, result):
-            self.assertAllEqual(component[i]**2, result_component)
+      sess.run(init_op)
+      for x in [1., 2., 3., 5.]:
+        self.assertEqual(x, sess.run(get_next))
       with self.assertRaises(errors.OutOfRangeError):
         sess.run(get_next)
 
-      # Test multi-threaded access to the same iterator.
-      sess.run(init_op, feed_dict={count: 18})
-      results = []
-      def iterator_thread():
-        while True:
-          try:
-            results.append(sess.run(get_next))
-          except errors.OutOfRangeError:
-            return
-      threads = [self.checkedThread(target=iterator_thread) for _ in range(8)]
-      for t in threads:
-        t.start()
-      for t in threads:
-        t.join()
+  def testParallelMapIgnoreError(self):
+    components = np.array([1., 2., 3., np.nan, 5.]).astype(np.float32)
 
-      # `results` will contain the same elements components**2
-      # repeated 18 times, but in a non-deterministic order. Sort the
-      # results, and assert that each element of components**2 is
-      # produced 18 times.
-      results.sort(key=lambda x: x[0])
-      for i in range(7):
-        for j in range(18):
-          for component, result_component in zip(components,
-                                                 results[i * 18 + j]):
-            self.assertAllEqual(component[i]**2, result_component)
-
-  def _buildParallelMapDataset(self, components, count, num_threads,
-                               output_buffer_size):
-    def _map_fn(x, y, z):
-      return math_ops.square(x), math_ops.square(y), math_ops.square(z)
-    return (dataset_ops.Dataset.from_tensor_slices(components).map(
-        _map_fn, num_threads=num_threads, output_buffer_size=output_buffer_size)
-            .repeat(count))
-
-  def testParallelMapDataset(self):
-    """Test an dataset that maps a TF function across its input elements."""
-    # The pipeline is TensorSliceDataset -> ParallelMapDataset(square_3) ->
-    # RepeatDataset(count).
-    components = [np.arange(7),
-                  np.array([[1, 2, 3]]) * np.arange(7)[:, np.newaxis],
-                  np.array(37.0) * np.arange(7)]
-    count = array_ops.placeholder(dtypes.int64, shape=[])
-    num_threads = array_ops.placeholder(dtypes.int32, shape=[])
-    output_buffer_size = array_ops.placeholder(dtypes.int64, shape=[])
-
-    dataset = self._buildParallelMapDataset(components, count, num_threads,
-                                            output_buffer_size)
+    dataset = (
+        dataset_ops.Dataset.from_tensor_slices(components).map(
+            lambda x: array_ops.check_numerics(x, "message"),
+            num_parallel_calls=2).prefetch(2).apply(error_ops.ignore_errors()))
     iterator = dataset.make_initializable_iterator()
     init_op = iterator.initializer
     get_next = iterator.get_next()
 
-    self.assertEqual([c.shape[1:] for c in components],
-                     [t.shape for t in get_next])
+    with self.test_session() as sess:
+      sess.run(init_op)
+      for x in [1., 2., 3., 5.]:
+        self.assertEqual(x, sess.run(get_next))
+      with self.assertRaises(errors.OutOfRangeError):
+        sess.run(get_next)
+
+  def testReadFileIgnoreError(self):
+    def write_string_to_file(value, filename):
+      with open(filename, "w") as f:
+        f.write(value)
+    filenames = [os.path.join(self.get_temp_dir(), "file_%d.txt" % i)
+                 for i in range(5)]
+    for filename in filenames:
+      write_string_to_file(filename, filename)
+
+    dataset = (
+        dataset_ops.Dataset.from_tensor_slices(filenames).map(
+            io_ops.read_file, num_parallel_calls=2).prefetch(2).apply(
+                error_ops.ignore_errors()))
+    iterator = dataset.make_initializable_iterator()
+    init_op = iterator.initializer
+    get_next = iterator.get_next()
 
     with self.test_session() as sess:
-      def do_test(num_threads_val, output_buffer_size_val):
-        # Test single-threaded access to the iterator.
-        sess.run(init_op, feed_dict={
-            count: 14,
-            num_threads: num_threads_val,
-            output_buffer_size: output_buffer_size_val})
-        for _ in range(14):
-          for i in range(7):
-            result = sess.run(get_next)
-            for component, result_component in zip(components, result):
-              self.assertAllEqual(component[i]**2, result_component)
+      # All of the files are present.
+      sess.run(init_op)
+      for filename in filenames:
+        self.assertEqual(compat.as_bytes(filename), sess.run(get_next))
+      with self.assertRaises(errors.OutOfRangeError):
+        sess.run(get_next)
+
+      # Delete one of the files.
+      os.remove(filenames[0])
+
+      # Attempting to read filenames[0] will fail, but ignore_errors()
+      # will catch the error.
+      sess.run(init_op)
+      for filename in filenames[1:]:
+        self.assertEqual(compat.as_bytes(filename), sess.run(get_next))
+      with self.assertRaises(errors.OutOfRangeError):
+        sess.run(get_next)
+
+  def testCaptureResourceInMapFn(self):
+
+    def _build_ds(iterator):
+
+      def _map_fn(x):
+        get_next = iterator.get_next()
+        return x * get_next
+
+      return dataset_ops.Dataset.range(10).map(_map_fn)
+
+    def _build_graph():
+      captured_iterator = dataset_ops.Dataset.range(
+          10).make_initializable_iterator()
+      ds = _build_ds(captured_iterator)
+      iterator = ds.make_initializable_iterator()
+      init_op = iterator.initializer
+      get_next = iterator.get_next()
+      return captured_iterator.initializer, init_op, get_next
+
+    with ops.Graph().as_default() as g:
+      captured_init_op, init_op, get_next = _build_graph()
+      with self.test_session(graph=g) as sess:
+        sess.run(captured_init_op)
+        sess.run(init_op)
+        for i in range(10):
+          self.assertEquals(i * i, sess.run(get_next))
         with self.assertRaises(errors.OutOfRangeError):
           sess.run(get_next)
 
-        # Test multi-threaded access to the same iterator.
-        sess.run(init_op, feed_dict={
-            count: 18,
-            num_threads: num_threads_val,
-            output_buffer_size: output_buffer_size_val})
-        results = []
-        def iterator_thread():
-          while True:
-            try:
-              results.append(sess.run(get_next))
-            except errors.OutOfRangeError:
-              return
-        threads = [self.checkedThread(target=iterator_thread) for _ in range(8)]
-        for t in threads:
-          t.start()
-        for t in threads:
-          t.join()
 
-        # `results` will contain the same elements components**2
-        # repeated 18 times, but in a non-deterministic order. Sort the
-        # results, and assert that each element of components**2 is
-        # produced 18 times.
-        results.sort(key=lambda x: x[0])
-        for i in range(7):
-          for j in range(18):
-            for component, result_component in zip(components,
-                                                   results[i * 18 + j]):
-              self.assertAllEqual(component[i]**2, result_component)
+class MapDatasetBenchmark(test.Benchmark):
 
-      for num_threads_val, output_buffer_size_val in [
-          (1, 1), (1, 2), (2, 2), (2, 4), (8, 8), (8, 16)]:
-        do_test(num_threads_val, output_buffer_size_val)
+  # The purpose of this benchmark is to compare the performance of chaining vs
+  # fusing of the map and batch transformations across various configurations.
+  #
+  # NOTE: It is recommended to build the benchmark with
+  # `-c opt --copt=-mavx --copt=-mavx2 --copt=-mfma --copt=-gmlt`
+  # and execute it on a machine with at least 32 CPU cores.
+  def benchmarkMapAndBatch(self):
 
-  def _testDisposeParallelMapDataset(self, explicit_dispose):
-    # The pipeline is TensorSliceDataset -> MapDataset(square_3) ->
-    # RepeatDataset(1000).
-    components = [np.arange(1000),
-                  np.array([[1, 2, 3]]) * np.arange(1000)[:, np.newaxis],
-                  np.array(37.0) * np.arange(1000)]
+    # Sequential pipeline configurations.
+    seq_elem_size_series = itertools.product([1], [1], [1, 2, 4, 8], [16])
+    seq_batch_size_series = itertools.product([1], [1], [1], [8, 16, 32, 64])
 
-    dataset = self._buildParallelMapDataset(components, 1000, 100, 100)
-    iterator = dataset.make_initializable_iterator()
-    init_op = iterator.initializer
-    get_next = iterator.get_next()
-    if explicit_dispose:
-      dispose_op = iterator.dispose_op()
+    # Parallel pipeline configuration.
+    par_elem_size_series = itertools.product([32], [32], [1, 2, 4, 8], [256])
+    par_batch_size_series = itertools.product([32], [32], [1],
+                                              [128, 256, 512, 1024])
+    par_num_calls_series = itertools.product([8, 16, 32, 64], [32], [1], [512])
+    par_inter_op_series = itertools.product([32], [8, 16, 32, 64], [1], [512])
 
-    with self.test_session() as sess:
-      sess.run(init_op)
-      for _ in range(3):
-        sess.run(get_next)
-      if explicit_dispose:
-        sess.run(dispose_op)
+    def name(method, label, num_calls, inter_op, element_size, batch_size):
+      return ("%s_id_%s_num_calls_%d_inter_op_%d_elem_size_%d_batch_size_%d" % (
+          method,
+          hashlib.sha1(label).hexdigest(),
+          num_calls,
+          inter_op,
+          element_size,
+          batch_size,
+      ))
 
-  def testExplicitDisposeParallelMapDataset(self):
-    self._testDisposeParallelMapDataset(True)
+    def benchmark(label, series):
 
-  def testImplicitDisposeParallelMapDataset(self):
-    self._testDisposeParallelMapDataset(False)
+      print("%s:" % label)
+      for num_calls, inter_op, element_size, batch_size in series:
 
-  def testParallelMapError(self):
-    components = [np.array([1., 2., 3., np.nan, 5.]).astype(np.float32)]
+        num_iters = 1024 // (
+            (element_size * batch_size) // min(num_calls, inter_op))
+        k = 1024 * 1024
+        dataset = dataset_ops.Dataset.from_tensors((np.random.rand(
+            element_size, 4 * k), np.random.rand(4 * k, 1))).repeat()
 
-    dataset = (dataset_ops.Dataset.from_tensor_slices(components)
-               .map(lambda x: array_ops.check_numerics(x, "message")))
-    iterator = dataset.make_initializable_iterator()
-    init_op = iterator.initializer
-    get_next = iterator.get_next()
+        chained_dataset = dataset.map(
+            math_ops.matmul,
+            num_parallel_calls=num_calls).batch(batch_size=batch_size)
+        chained_iterator = chained_dataset.make_one_shot_iterator()
+        chained_get_next = chained_iterator.get_next()
 
-    with self.test_session() as sess:
-      sess.run(init_op)
-      for _ in range(3):
-        sess.run(get_next)
-      # The 4th element is NaN, so `array_ops.check_numerics()` should fail.
-      with self.assertRaises(errors.InvalidArgumentError):
-        sess.run(get_next)
-      sess.run(get_next)
-      with self.assertRaises(errors.OutOfRangeError):
-        sess.run(get_next)
+        chained_deltas = []
+        with session.Session(
+            config=config_pb2.ConfigProto(
+                inter_op_parallelism_threads=inter_op,
+                use_per_session_threads=True)) as sess:
+          for _ in range(5):
+            sess.run(chained_get_next.op)
+          for _ in range(num_iters):
+            start = time.time()
+            sess.run(chained_get_next.op)
+            end = time.time()
+            chained_deltas.append(end - start)
 
-  def testCaptureHashTable(self):
-    # NOTE(mrry): We must use the V2 variants of `HashTable`
-    # etc. because these produce a `tf.resource`-typed output that is
-    # compatible with the in-graph function implementation.
-    default_val = -1
-    keys = constant_op.constant(["brain", "salad", "surgery"])
-    values = constant_op.constant([0, 1, 2], dtypes.int64)
-    table = lookup_ops.HashTable(
-        lookup_ops.KeyValueTensorInitializer(keys, values), default_val)
+        fused_dataset = dataset = dataset.apply(
+            batching.map_and_batch(
+                math_ops.matmul,
+                num_parallel_calls=num_calls,
+                batch_size=batch_size))
+        fused_iterator = fused_dataset.make_one_shot_iterator()
+        fused_get_next = fused_iterator.get_next()
 
-    input_sentences = dataset_ops.Dataset.from_tensor_slices(
-        constant_op.constant([
-            "brain brain tank salad surgery",
-            "surgery brain",
-        ]))
+        fused_deltas = []
+        with session.Session(
+            config=config_pb2.ConfigProto(
+                inter_op_parallelism_threads=inter_op,
+                use_per_session_threads=True)) as sess:
 
-    iterator = (input_sentences
-                .map(lambda x: string_ops.string_split([x]).values)
-                .map(table.lookup)
-                .make_initializable_iterator())
-    init_op = iterator.initializer
-    get_next = iterator.get_next()
+          for _ in range(5):
+            sess.run(fused_get_next.op)
+          for _ in range(num_iters):
+            start = time.time()
+            sess.run(fused_get_next.op)
+            end = time.time()
+            fused_deltas.append(end - start)
 
-    with self.test_session() as sess:
-      sess.run(table.init)
-      sess.run(init_op)
+        print(
+            "batch size: %d, num parallel calls: %d, inter-op parallelism: %d, "
+            "element size: %d, num iters: %d\nchained wall time: %f (median), "
+            "%f (mean), %f (stddev), %f (min), %f (max)\n  fused wall time: "
+            "%f (median), %f (mean), %f (stddev), %f (min), %f (max)\n    "
+            "chained/fused:    %.2fx (median),    %.2fx (mean)" %
+            (batch_size, num_calls, inter_op, element_size, num_iters,
+             np.median(chained_deltas), np.mean(chained_deltas),
+             np.std(chained_deltas), np.min(chained_deltas),
+             np.max(chained_deltas), np.median(fused_deltas),
+             np.mean(fused_deltas), np.std(fused_deltas), np.min(fused_deltas),
+             np.max(fused_deltas),
+             np.median(chained_deltas) / np.median(fused_deltas),
+             np.mean(chained_deltas) / np.mean(fused_deltas)))
 
-      print(sess.run(get_next))
-      print(sess.run(get_next))
-      with self.assertRaises(errors.OutOfRangeError):
-        sess.run(get_next)
+        self.report_benchmark(
+            iters=num_iters,
+            wall_time=np.median(chained_deltas),
+            name=name("chained", label, num_calls, inter_op, element_size,
+                      batch_size))
 
-  def testCaptureQueue(self):
-    elements = np.random.randint(100, size=[200])
-    queue = data_flow_ops.FIFOQueue(200, dtypes.int64, shapes=[])
-    enqueue_op = queue.enqueue_many(elements)
-    close_op = queue.close()
-    iterator = (dataset_ops.Dataset.from_tensors(0).repeat(-1)
-                .map(lambda _: queue.dequeue()).make_initializable_iterator())
-    init_op = iterator.initializer
-    get_next = iterator.get_next()
+        self.report_benchmark(
+            iters=num_iters,
+            wall_time=np.median(fused_deltas),
+            name=name("fused", label, num_calls, inter_op, element_size,
+                      batch_size))
 
-    with self.test_session() as sess:
-      sess.run(enqueue_op)
-      sess.run(close_op)
-      sess.run(init_op)
-      for element in elements:
-        self.assertEqual(element, sess.run(get_next))
-      with self.assertRaises(errors.OutOfRangeError):
-        sess.run(get_next)
+      print("")
 
-  def testCaptureVariable(self):
-    counter_var = variable_scope.get_variable(
-        "counter", (), dtypes.int32, use_resource=True)
-    iterator = (dataset_ops.Dataset.from_tensors(0).repeat(10)
-                .map(lambda _: counter_var.assign_add(1))
-                .make_initializable_iterator())
-    init_op = iterator.initializer
-    get_next = iterator.get_next()
-
-    with self.test_session() as sess:
-      sess.run(counter_var.initializer)
-      sess.run(init_op)
-      for i in range(10):
-        self.assertEqual(i, sess.run(counter_var))
-        self.assertEqual(i + 1, sess.run(get_next))
-      self.assertEqual(10, sess.run(counter_var))
-      with self.assertRaises(errors.OutOfRangeError):
-        sess.run(get_next)
-      self.assertEqual(10, sess.run(counter_var))
-
-  def testCaptureUninitializedVariableError(self):
-    counter_var = variable_scope.get_variable(
-        "counter", (), dtypes.int32, use_resource=True)
-    iterator = (dataset_ops.Dataset.from_tensors(0).repeat(10)
-                .map(lambda _: counter_var.assign_add(1))
-                .make_initializable_iterator())
-    init_op = iterator.initializer
-
-    with self.test_session() as sess:
-      with self.assertRaisesRegexp(errors.FailedPreconditionError,
-                                   "Failed to capture resource"):
-        sess.run(init_op)
-
-  def testSeededStatefulOperatorIsProperlyStateful(self):
-    iterator = (dataset_ops.Dataset.from_tensors(0).repeat(10)
-                .map(lambda _: random_ops.random_uniform((), seed=11)).batch(2)
-                .make_initializable_iterator())
-    init_op = iterator.initializer
-    get_next = iterator.get_next()
-
-    with self.test_session() as sess:
-      sess.run(init_op)
-      random_values = []
-      with self.assertRaises(errors.OutOfRangeError):
-        while True:
-          random_values.extend(sess.run(get_next))
-      self.assertEqual(10, len(random_values))
-      self.assertGreater(np.abs(np.diff(random_values)).max(), 1e-6)
-      sess.run(init_op)
-      random_values_2 = []
-      with self.assertRaises(errors.OutOfRangeError):
-        while True:
-          random_values_2.extend(sess.run(get_next))
-
-      # Randomness is repeatable given same seed
-      self.assertAllClose(random_values, random_values_2)
+    np.random.seed(_NUMPY_RANDOM_SEED)
+    benchmark("Sequential element size evaluation", seq_elem_size_series)
+    benchmark("Sequential batch size evaluation", seq_batch_size_series)
+    benchmark("Parallel element size evaluation", par_elem_size_series)
+    benchmark("Parallel batch size evaluation", par_batch_size_series)
+    benchmark("Transformation parallelism evaluation", par_num_calls_series)
+    benchmark("Threadpool size evaluation", par_inter_op_series)
 
 if __name__ == "__main__":
   test.main()

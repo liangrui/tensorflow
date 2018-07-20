@@ -24,6 +24,7 @@ import six
 
 from tensorflow.contrib import lookup
 from tensorflow.python.client import session
+from tensorflow.python.eager import context
 from tensorflow.python.framework import constant_op
 from tensorflow.python.framework import dtypes
 from tensorflow.python.framework import errors_impl
@@ -57,6 +58,12 @@ class HashTableOpTest(test.TestCase):
 
       result = output.eval()
       self.assertAllEqual([0, 1, -1], result)
+
+      exported_keys_tensor, exported_values_tensor = table.export()
+
+      self.assertItemsEqual([b"brain", b"salad", b"surgery"],
+                            exported_keys_tensor.eval())
+      self.assertItemsEqual([0, 1, 2], exported_values_tensor.eval())
 
   def testHashTableFindHighRank(self):
     with self.test_session():
@@ -187,6 +194,11 @@ class HashTableOpTest(test.TestCase):
           lookup.KeyValueTensorInitializer(keys, values), default_val)
       table.init.run()
 
+      # Ref types do not produce a lookup signature mismatch.
+      input_string_ref = variables.Variable("brain")
+      variables.global_variables_initializer().run()
+      self.assertEqual(0, table.lookup(input_string_ref).eval())
+
       input_string = constant_op.constant([1, 2, 3], dtypes.int64)
       with self.assertRaises(TypeError):
         table.lookup(input_string)
@@ -267,6 +279,21 @@ class HashTableOpTest(test.TestCase):
     with session2:
       table.init.run()
       self.assertAllEqual(3, table.size().eval())
+
+  def testHashTableInt32String(self):
+    with self.test_session():
+      default_val = "n/a"
+      keys = constant_op.constant([0, 1, 2], dtypes.int32)
+      values = constant_op.constant(["brain", "salad", "surgery"])
+      table = lookup.HashTable(
+          lookup.KeyValueTensorInitializer(keys, values), default_val)
+      table.init.run()
+
+      input_tensor = constant_op.constant([0, 1, -1])
+      output = table.lookup(input_tensor)
+
+      result = output.eval()
+      self.assertAllEqual([b"brain", b"salad", b"n/a"], result)
 
 
 class MutableHashTableOpTest(test.TestCase):
@@ -628,6 +655,17 @@ class MutableHashTableOpTest(test.TestCase):
 
       table.insert(keys, values).run()
       self.assertAllEqual(3, table.size().eval())
+
+      input_string_ref = variables.Variable("brain")
+      input_int64_ref = variables.Variable(-1, dtype=dtypes.int64)
+      variables.global_variables_initializer().run()
+
+      # Ref types do not produce an insert signature mismatch.
+      table.insert(input_string_ref, input_int64_ref).run()
+      self.assertAllEqual(3, table.size().eval())
+
+      # Ref types do not produce a lookup signature mismatch.
+      self.assertEqual(-1, table.lookup(input_string_ref).eval())
 
       # lookup with keys of the wrong type
       input_string = constant_op.constant([1, 2, 3], dtypes.int64)
@@ -1187,6 +1225,36 @@ class IndexTableFromFile(test.TestCase):
       lookup_ops.tables_initializer().run()
       self.assertAllEqual((1, 2, 3), ids.eval())
 
+  def test_string_index_table_from_file_tensor_filename(self):
+    vocabulary_file = self._createVocabFile("f2i_vocab1.txt")
+    with self.test_session():
+      vocabulary_file = constant_op.constant(vocabulary_file)
+      table = lookup.index_table_from_file(
+          vocabulary_file=vocabulary_file, num_oov_buckets=1)
+      ids = table.lookup(constant_op.constant(["salad", "surgery", "tarkus"]))
+
+      self.assertRaises(errors_impl.OpError, ids.eval)
+      lookup_ops.tables_initializer().run()
+      self.assertAllEqual((1, 2, 3), ids.eval())
+      self.assertEqual(1,
+                       len(ops.get_collection(ops.GraphKeys.ASSET_FILEPATHS)))
+
+  def test_string_index_table_from_file_placeholder_filename(self):
+    vocabulary_file = self._createVocabFile("f2i_vocab1.txt")
+    with self.test_session():
+      vocabulary_placeholder = array_ops.placeholder(dtypes.string, [])
+      table = lookup.index_table_from_file(
+          vocabulary_file=vocabulary_placeholder, num_oov_buckets=1)
+      ids = table.lookup(constant_op.constant(["salad", "surgery", "tarkus"]))
+
+      self.assertRaises(errors_impl.OpError, ids.eval)
+
+      feed_dict = {vocabulary_placeholder.name: vocabulary_file}
+      lookup_ops.tables_initializer().run(feed_dict=feed_dict)
+      self.assertAllEqual((1, 2, 3), ids.eval())
+      self.assertEqual(0,
+                       len(ops.get_collection(ops.GraphKeys.ASSET_FILEPATHS)))
+
   def test_int32_index_table_from_file(self):
     vocabulary_file = self._createVocabFile(
         "f2i_vocab2.txt", values=("42", "1", "-1000"))
@@ -1245,7 +1313,13 @@ class IndexTableFromFile(test.TestCase):
               860),  # 3 + fingerprint("toccata") mod 300.
           ids.eval())
 
-  def test_index_table_from_file_with_only_oov_buckets(self):
+  def test_index_table_from_file_fails_with_empty_vocabulary_file_name(self):
+    self.assertRaises(
+        ValueError,
+        lookup.index_table_from_file,
+        vocabulary_file="")
+
+  def test_index_table_from_file_fails_with_empty_vocabulary(self):
     self.assertRaises(
         ValueError,
         lookup.index_table_from_file,
@@ -1338,15 +1412,22 @@ class KeyValueTensorInitializerTest(test.TestCase):
 
 class IndexTableFromTensor(test.TestCase):
 
+  @test_util.run_in_graph_and_eager_modes
   def test_index_table_from_tensor_with_tensor_init(self):
-    with self.test_session():
+    table = lookup.index_table_from_tensor(
+        mapping=("brain", "salad", "surgery"), num_oov_buckets=1)
+
+    if not context.executing_eagerly():
+      with self.assertRaises(errors_impl.OpError):
+        self.evaluate(table.lookup(
+            constant_op.constant(("salad", "surgery", "tarkus"))))
+    else:
+      # Reinitializing a table in eager should work.
       table = lookup.index_table_from_tensor(
           mapping=("brain", "salad", "surgery"), num_oov_buckets=1)
-      ids = table.lookup(constant_op.constant(("salad", "surgery", "tarkus")))
-
-      self.assertRaises(errors_impl.OpError, ids.eval)
-      lookup_ops.tables_initializer().run()
-      self.assertAllEqual((1, 2, 3), ids.eval())
+    self.evaluate(lookup_ops.tables_initializer())
+    ids = table.lookup(constant_op.constant(("salad", "surgery", "tarkus")))
+    self.assertAllEqual((1, 2, 3), self.evaluate(ids))
 
   def test_int32_index_table_from_tensor_with_tensor_init(self):
     with self.test_session():
@@ -1604,23 +1685,22 @@ class InitializeTableFromFileOpTest(test.TestCase):
       f.write("\n".join(values) + "\n")
     return vocabulary_file
 
+  @test_util.run_in_graph_and_eager_modes
   def testInitializeStringTable(self):
     vocabulary_file = self._createVocabFile("one_column_1.txt")
+    default_value = -1
+    table = lookup.HashTable(
+        lookup.TextFileInitializer(vocabulary_file, dtypes.string,
+                                   lookup.TextFileIndex.WHOLE_LINE,
+                                   dtypes.int64,
+                                   lookup.TextFileIndex.LINE_NUMBER),
+        default_value)
+    self.evaluate(table.init)
 
-    with self.test_session():
-      default_value = -1
-      table = lookup.HashTable(
-          lookup.TextFileInitializer(vocabulary_file, dtypes.string,
-                                     lookup.TextFileIndex.WHOLE_LINE,
-                                     dtypes.int64,
-                                     lookup.TextFileIndex.LINE_NUMBER),
-          default_value)
-      table.init.run()
+    output = table.lookup(constant_op.constant(["brain", "salad", "tank"]))
 
-      output = table.lookup(constant_op.constant(["brain", "salad", "tank"]))
-
-      result = output.eval()
-      self.assertAllEqual([0, 1, -1], result)
+    result = self.evaluate(output)
+    self.assertAllEqual([0, 1, -1], result)
 
   def testInitializeInt64Table(self):
     vocabulary_file = self._createVocabFile(

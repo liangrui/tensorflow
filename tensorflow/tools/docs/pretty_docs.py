@@ -12,11 +12,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Classes for converting parsed doc content into markdown pages."""
+"""A module for converting parsed doc content into markdown pages.
+
+The adjacent `parser` module creates `PageInfo` objects, containing all data
+necessary to document an element of the TensorFlow API.
+
+This module contains one public function, which handels the conversion of these
+`PageInfo` objects into a markdown string:
+
+    md_page = build_md_page(page_info)
+"""
 
 from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
+
+import textwrap
 
 
 def build_md_page(page_info):
@@ -48,9 +59,9 @@ def _build_function_page(page_info):
   """Given a FunctionPageInfo object Return the page as an md string."""
   parts = ['# %s\n\n' % page_info.full_name]
 
-  if page_info.aliases:
-    parts.extend('### `%s`\n' % name
-                 for name in page_info.aliases)
+  if len(page_info.aliases) > 1:
+    parts.append('### Aliases:\n\n')
+    parts.extend('* `%s`\n' % name for name in page_info.aliases)
     parts.append('\n')
 
   if page_info.signature is not None:
@@ -72,8 +83,19 @@ def _build_class_page(page_info):
   """Given a ClassPageInfo object Return the page as an md string."""
   parts = ['# {page_info.full_name}\n\n'.format(page_info=page_info)]
 
-  if page_info.aliases:
-    parts.extend('### `class %s`\n' % name for name in page_info.aliases)
+  parts.append('## Class `%s`\n\n' % page_info.full_name.split('.')[-1])
+  if page_info.bases:
+    parts.append('Inherits From: ')
+
+    link_template = '[`{short_name}`]({url})'
+    parts.append(', '.join(
+        link_template.format(**base._asdict()) for base in page_info.bases))
+
+  parts.append('\n\n')
+
+  if len(page_info.aliases) > 1:
+    parts.append('### Aliases:\n\n')
+    parts.extend('* Class `%s`\n' % name for name in page_info.aliases)
     parts.append('\n')
 
   if page_info.defined_in is not None:
@@ -83,7 +105,8 @@ def _build_class_page(page_info):
   parts.append(page_info.guides)
   parts.append(page_info.doc.docstring)
   parts.append(_build_function_details(page_info.doc.function_details))
-  assert not page_info.doc.compatibility
+  parts.append(_build_compatibility(page_info.doc.compatibility))
+
   parts.append('\n\n')
 
   if page_info.classes:
@@ -105,7 +128,8 @@ def _build_class_page(page_info):
 
       parts.append(prop_info.doc.docstring)
       parts.append(_build_function_details(prop_info.doc.function_details))
-      assert not prop_info.doc.compatibility
+      parts.append(_build_compatibility(prop_info.doc.compatibility))
+
       parts.append('\n\n')
 
     parts.append('\n\n')
@@ -123,10 +147,10 @@ def _build_class_page(page_info):
       h3 = ('<h3 id="{short_name}">'
             '<code>{short_name}</code>'
             '</h3>\n\n')
-      parts.append(h3.format(**method_info.__dict__))
+      parts.append(h3.format(**method_info._asdict()))
 
       if method_info.signature is not None:
-        parts.append(_build_signature(method_info))
+        parts.append(_build_signature(method_info, use_full_name=False))
 
       parts.append(method_info.doc.docstring)
       parts.append(_build_function_details(method_info.doc.function_details))
@@ -150,11 +174,11 @@ def _build_class_page(page_info):
 
 def _build_module_page(page_info):
   """Given a ClassPageInfo object Return the page as an md string."""
-
   parts = ['# Module: {full_name}\n\n'.format(full_name=page_info.full_name)]
 
-  if page_info.aliases:
-    parts.extend('### Module `%s`\n' % name for name in page_info.aliases)
+  if len(page_info.aliases) > 1:
+    parts.append('### Aliases:\n\n')
+    parts.extend('* Module `%s`\n' % name for name in page_info.aliases)
     parts.append('\n')
 
   if page_info.defined_in is not None:
@@ -162,6 +186,8 @@ def _build_module_page(page_info):
     parts.append(str(page_info.defined_in))
 
   parts.append(page_info.doc.docstring)
+  parts.append(_build_compatibility(page_info.doc.compatibility))
+
   parts.append('\n\n')
 
   if page_info.modules:
@@ -169,7 +195,7 @@ def _build_module_page(page_info):
     template = '[`{short_name}`]({url}) module'
 
     for item in page_info.modules:
-      parts.append(template.format(**item.__dict__))
+      parts.append(template.format(**item._asdict()))
 
       if item.doc.brief:
         parts.append(': ' + item.doc.brief)
@@ -181,7 +207,7 @@ def _build_module_page(page_info):
     template = '[`class {short_name}`]({url})'
 
     for item in page_info.classes:
-      parts.append(template.format(**item.__dict__))
+      parts.append(template.format(**item._asdict()))
 
       if item.doc.brief:
         parts.append(': ' + item.doc.brief)
@@ -193,7 +219,7 @@ def _build_module_page(page_info):
     template = '[`{short_name}(...)`]({url})'
 
     for item in page_info.functions:
-      parts.append(template.format(**item.__dict__))
+      parts.append(template.format(**item._asdict()))
 
       if item.doc.brief:
         parts.append(': ' + item.doc.brief)
@@ -206,25 +232,24 @@ def _build_module_page(page_info):
     parts.append('## Other Members\n\n')
 
     for item in page_info.other_members:
-      parts.append('`{short_name}`\n\n'.format(**item.__dict__))
+      parts.append('`{short_name}`\n\n'.format(**item._asdict()))
 
   return ''.join(parts)
 
 
-def _build_signature(obj_info):
+def _build_signature(obj_info, use_full_name=True):
   """Returns a md code block showing the function signature."""
   # Special case tf.range, since it has an optional first argument
   if obj_info.full_name == 'tf.range':
     return (
         '``` python\n'
-        "range(limit, delta=1, dtype=None, name='range')\n"
-        "range(start, limit, delta=1, dtype=None, name='range')\n"
+        "tf.range(limit, delta=1, dtype=None, name='range')\n"
+        "tf.range(start, limit, delta=1, dtype=None, name='range')\n"
         '```\n\n')
 
-  signature_template = '\n'.join([
-      '``` python',
-      '{name}({sig})',
-      '```\n\n'])
+  parts = ['``` python']
+  parts.extend(['@' + dec for dec in obj_info.decorators])
+  signature_template = '{name}({sig})'
 
   if not obj_info.signature:
     sig = ''
@@ -234,7 +259,14 @@ def _build_signature(obj_info):
     sig = ',\n'.join('    %s' % sig_item for sig_item in obj_info.signature)
     sig = '\n'+sig+'\n'
 
-  return signature_template.format(name=obj_info.short_name, sig=sig)
+  if use_full_name:
+    obj_name = obj_info.full_name
+  else:
+    obj_name = obj_info.short_name
+  parts.append(signature_template.format(name=obj_name, sig=sig))
+  parts.append('```\n\n')
+
+  return '\n'.join(parts)
 
 
 def _build_compatibility(compatibility):
@@ -244,7 +276,9 @@ def _build_compatibility(compatibility):
   for key in sorted_keys:
 
     value = compatibility[key]
-    parts.append('\n\n#### %s compatibility\n%s\n' % (key, value))
+    # Dedent so that it does not trigger markdown code formatting.
+    value = textwrap.dedent(value)
+    parts.append('\n\n#### %s Compatibility\n%s\n' % (key.title(), value))
 
   return ''.join(parts)
 
@@ -255,9 +289,9 @@ def _build_function_details(function_details):
   for detail in function_details:
     sub = []
     sub.append('#### ' + detail.keyword + ':\n\n')
-    sub.append(detail.header)
+    sub.append(textwrap.dedent(detail.header))
     for key, value in detail.items:
-      sub.append('* <b>`%s`</b>:%s' % (key, value))
+      sub.append('* <b>`%s`</b>: %s' % (key, value))
     parts.append(''.join(sub))
 
   return '\n'.join(parts)

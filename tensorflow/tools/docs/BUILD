@@ -37,6 +37,11 @@ py_library(
     srcs = ["parser.py"],
     srcs_version = "PY2AND3",
     visibility = ["//visibility:public"],
+    deps = [
+        "//tensorflow/python:platform",
+        "//tensorflow/python:util",
+        "@astor_archive//:astor",
+    ],
 )
 
 py_test(
@@ -44,7 +49,6 @@ py_test(
     size = "small",
     srcs = ["parser_test.py"],
     srcs_version = "PY2AND3",
-    tags = ["manual"],
     deps = [
         ":parser",
         "//tensorflow/python:platform_test",
@@ -78,13 +82,10 @@ py_test(
     size = "small",
     srcs = ["generate_lib_test.py"],
     srcs_version = "PY2AND3",
-    tags = ["manual"],
     deps = [
         ":generate_lib",
         ":parser",
-        "//tensorflow:tensorflow_py",
         "//tensorflow/python:platform_test",
-        "//tensorflow/python/debug:debug_py",
     ],
 )
 
@@ -95,6 +96,7 @@ py_binary(
     deps = [
         ":generate_lib",
         "//tensorflow:tensorflow_py",
+        "//tensorflow/python:util",
         "//tensorflow/python/debug:debug_py",
     ],
 )
@@ -105,7 +107,13 @@ py_test(
     srcs = ["build_docs_test.py"],
     data = ["//tensorflow:docs_src"],
     srcs_version = "PY2AND3",
-    tags = ["manual"],
+    tags = [
+        # No reason to run sanitizers or fastbuild for this test.
+        "noasan",
+        "nomsan",
+        "notsan",
+        "optonly",
+    ],
     deps = [
         ":generate_lib",
         "//tensorflow:tensorflow_py",
@@ -139,15 +147,4 @@ py_test(
         ":py_guide_parser",
         "//tensorflow/python:client_testlib",
     ],
-)
-
-filegroup(
-    name = "all_files",
-    srcs = glob(
-        ["**/*"],
-        exclude = [
-            "**/METADATA",
-            "**/OWNERS",
-        ],
-    ),
 )
